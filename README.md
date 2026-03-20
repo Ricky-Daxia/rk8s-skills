@@ -11,11 +11,22 @@
 ## Installation
 
 ```bash
-# Install a skill using slash command
-/install-skill https://github.com/Ricky-Daxia/rk8s-skills/tree/main/rk8s-single
+# One-line install (all supported agents: Claude Code, Codex, Cursor, Copilot, Cline, etc.)
+npx skills add Ricky-Daxia/rk8s-skills -g -y
 ```
 
-Or manually copy the skill directory to `~/.claude/skills/`.
+Other ways to install:
+
+```bash
+# Full GitHub URL
+npx skills add https://github.com/Ricky-Daxia/rk8s-skills -g -y
+
+# Only install to Claude Code
+npx skills add Ricky-Daxia/rk8s-skills -g -y -a claude
+
+# Install a specific skill
+npx skills add Ricky-Daxia/rk8s-skills -g -y -s rk8s-single
+```
 
 ## What is rk8s?
 
