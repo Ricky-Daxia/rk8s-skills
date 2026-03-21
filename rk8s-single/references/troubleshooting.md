@@ -2,116 +2,124 @@
 
 ## Common Issues
 
-### 1. "cp command failed with exit code: Some(1)"
+### 1. "container already exists" loop during pod creation
 
 **Where**: Pod creation, pause container sandbox setup
-**Cause**: The pause:3.9 image layer is stored as a gzip file (not unpacked to a directory) in `/var/lib/rkforge/layers/`. This happens because the default registry serves pause with Docker media types (`application/vnd.docker.image.rootfs.diff.tar.gzip`) which rkforge's media type detector doesn't recognize as tar+gzip.
+**Cause**: Stale containers from a previous deployment exist in `/run/youki/`. When RKS tries to create a new pod with the same name, the pause container creation fails because the old container state is still registered.
 
-**Fix**: See `fix-pause-layer.md` for the full script. Quick fix:
+**This is the most common issue.** It happens when:
+- A previous deployment failed or was interrupted
+- Pods were deleted from the control plane but containers weren't cleaned up
+- Multiple pods were deployed simultaneously (see Step 9 in SKILL.md)
+
+**Fix**: Full cleanup is required:
 ```bash
-# Find the bad layer
-LAYER_HASH=$(curl -s http://47.79.87.161:8968/v2/library/pause/manifests/3.9 \
-  -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['layers'][0]['digest'].split(':')[1])")
-LAYER_PATH="/var/lib/rkforge/layers/$LAYER_HASH"
+# Stop services
+sudo killall rkl rks 2>/dev/null
+sleep 2
 
-# Convert file to directory
-sudo mv "$LAYER_PATH" "${LAYER_PATH}.gz"
-sudo mkdir -p "$LAYER_PATH"
-sudo tar xzf "${LAYER_PATH}.gz" -C "$LAYER_PATH"
-sudo rm "${LAYER_PATH}.gz"
+# Unmount all FUSE mounts first (required before rm)
+mount | grep -E "fuse.*rkl|slayerfs.*rkl" | awk '{print $3}' | while read mnt; do
+  sudo umount -l "$mnt" 2>/dev/null
+done
+
+# Clean container runtime state
+sudo find /run/youki -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
+# Clean rkl data
+sudo find /var/lib/rkl/bundle -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+sudo find /var/lib/rkl/pods -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+sudo find /var/lib/rkl/volumes -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
+# Clean CNI bridge
+sudo ip link set cni0 down 2>/dev/null
+sudo brctl delbr cni0 2>/dev/null
+
+# Restart Xline to clear stale pod data
+docker stop node1 node2 node3 2>/dev/null
+docker rm node1 node2 node3 2>/dev/null
+# Then re-run Xline start from Step 6
+
+# Restart RKS and RKL
+# Re-run Steps 7 and 8
 ```
 
-**Prevention**: After fixing, don't clear the rkforge cache (`/var/lib/rkforge/layers/`), or you'll need to fix again.
+**Important**: Use `find -exec rm` instead of `rm -rf /path/*`. Over SSH, glob expansion with `*` can silently fail.
 
-### 2. "executable '/pause' does not have correct permissions"
+**Important**: Unmount FUSE mounts BEFORE trying to remove directories. Active FUSE mounts prevent `rm -rf` from working.
 
-**Where**: Pod creation, pause container start
-**Cause**: The `pause` binary in the unpacked layer lacks execute permission.
-
-**Fix**:
-```bash
-# Find the pause binary in the layer
-find /var/lib/rkforge/layers/ -name "pause" -type f 2>/dev/null
-# Add execute permission
-sudo chmod +x /var/lib/rkforge/layers/<hash>/pause
-```
-
-### 3. Pod stuck in Pending
+### 2. Pod stuck in Pending (no error in logs)
 
 **Possible causes**:
 - RKL daemon not connected to RKS
 - Volume provisioning timeout
-- Image pull failure
 
 **Diagnosis**:
 ```bash
-# Check RKS logs for errors
-sudo tail -30 /tmp/rks.log | grep -E 'Error|error|fail|Heartbeat'
+# Check RKS logs for heartbeats
+tail -5 /tmp/rks.log | grep Heartbeat
+# Should see: "Heartbeat from node '<hostname>' (ready)" every ~5 seconds
 
-# Check if daemon is sending heartbeats
-sudo tail -5 /tmp/rks.log | grep Heartbeat
-# Should see: "Heartbeat from node '<hostname>' (ready)" every 5 seconds
-
-# Check for CSI errors
-sudo grep 'CSI\|volume\|Error' /tmp/rks.log | tail -10
+# Check for scheduling events
+grep -E "assigned|create|error|ERROR" /tmp/rks.log | tail -20
 ```
 
-### 4. "Failed to pull manifest"
+### 3. "Failed to pull manifest: manifest unknown"
+
+**Cause**: The requested image tag doesn't exist on the remote registry.
+
+**Fix**: Check available tags:
+```bash
+curl -s http://47.79.87.161:8968/v2/_catalog
+curl -s http://47.79.87.161:8968/v2/library/busybox/tags/list
+```
+
+Available images on the default registry:
+- `nginx:latest`
+- `busybox:latest` (NOT `busybox:1.36`)
+- `pause:3.9`
+
+### 4. "Failed to pull manifest" (connection error)
 
 **Cause**: rkforge is trying HTTPS on an HTTP-only registry.
 
-**Fix**: Ensure `~/.config/rk8s/rkforge.toml` has the registry in `insecure-registries`:
+**Fix**: Ensure `~/.config/rk8s/rkforge.toml` has:
 ```toml
 [registry]
 insecure-registries = ["47.79.87.161:8968"]
 ```
 
-Remember: with `sudo`, rkforge reads `$SUDO_USER`'s config, not root's. Check `echo $SUDO_USER` and look at that user's `~/.config/rk8s/rkforge.toml`.
+Remember: with `sudo`, rkforge reads `$SUDO_USER`'s config, not root's.
 
-### 5. rkforge pull very slow or times out
+### 5. nginx-web container shows Stopped
 
-**Cause**: The default registry (`47.79.87.161:8968`) has limited bandwidth. Large images like nginx (~60MB) take 5-10 minutes.
+**Cause**: Known issue. The nginx entrypoint script (`/docker-entrypoint.sh`) starts but the nginx process exits immediately in the rk8s container environment. The pod still shows `1/1 Running` because the pause sandbox is alive.
 
-**Workaround**: Use `--url` to specify an alternative registry, or try smaller images like `busybox:1.36` (~2MB) for testing.
+**Workaround**: This is cosmetic. The nginx pod's network namespace and volume still work. For testing, use busybox pods which run `sleep 3600` reliably.
 
-### 6. "container already exists" during pod creation
+### 6. Volume provisioning creates many duplicate volumes
 
-**Cause**: Stale containers from a previous failed attempt.
+**Cause**: Known watcher loop bug. Each time the watcher re-processes a pod, it provisions a new volume. This creates many volume entries in Xline and many FUSE mounts.
 
-**Fix**:
+**Impact**: Not harmful to pod operation. Extra volumes are cleaned up when the pod is deleted (though manual FUSE unmount may be needed).
+
+### 7. `rm -rf` doesn't actually delete directories
+
+**Cause**: Active FUSE mounts inside the directory tree prevent deletion.
+
+**Fix**: Always unmount first:
 ```bash
-# List and delete stale containers
-sudo rkl container list
-sudo rkl container delete <container-name>
-
-# Also clean CNI bridge
-sudo ip link set cni0 down 2>/dev/null
-sudo brctl delbr cni0 2>/dev/null
+mount | grep -E "fuse.*rkl|slayerfs.*rkl" | awk '{print $3}' | while read mnt; do
+  sudo umount -l "$mnt" 2>/dev/null
+done
 ```
 
-### 7. Container status is "Stopped" but pod shows "Running"
-
-**Cause**: The app container exited (possibly entrypoint script failure) but the pause sandbox container is still running. The pod status reflects the sandbox.
-
-**Diagnosis**:
-```bash
-# Check the container's OCI config for what command ran
-sudo cat /var/lib/rkl/bundle/<bundle-id>/config.json | python3 -c "
-import sys,json
-c=json.load(sys.stdin)
-print('args:', c['process']['args'])
-"
-```
-
-**Note**: The YAML `command` field does NOT override the image's OCI entrypoint — the image config takes precedence. Some images (like nginx) have complex entrypoint scripts that may fail in the rk8s container environment. Using `args: ["sleep", "3600"]` can help keep the container alive for debugging.
-
-### 8. Network issues after Xline restart
+### 8. Network issues after restart
 
 **Fix**: Clean up the old CNI bridge before restarting services:
 ```bash
-sudo ip link set cni0 down
-sudo brctl delbr cni0
+sudo ip link set cni0 down 2>/dev/null
+sudo brctl delbr cni0 2>/dev/null
 ```
 
 ## Full Reset Procedure
@@ -121,27 +129,31 @@ When things are badly broken, do a full reset:
 ```bash
 # 1. Kill services
 sudo killall rkl rks 2>/dev/null
+sleep 2
 
-# 2. Clean CNI
+# 2. Unmount all FUSE mounts
+mount | grep -E "fuse.*rkl|slayerfs.*rkl" | awk '{print $3}' | while read mnt; do
+  sudo umount -l "$mnt" 2>/dev/null
+done
+
+# 3. Clean all runtime state
+sudo find /run/youki -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+sudo find /var/lib/rkl/bundle -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+sudo find /var/lib/rkl/pods -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+sudo find /var/lib/rkl/volumes -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+
+# 4. Clean CNI
 sudo ip link set cni0 down 2>/dev/null
 sudo brctl delbr cni0 2>/dev/null
 
-# 3. Clean volume mounts
-sudo umount /var/lib/rkl/volumes/*/globalmount 2>/dev/null
-sudo umount /var/lib/rkl/pods/*/volumes/* 2>/dev/null
+# 5. Restart Xline (clears stale pod data)
+docker stop node1 node2 node3 2>/dev/null
+docker rm node1 node2 node3 2>/dev/null
+# Re-run Step 6
 
-# 4. Clean runtime state (WARNING: destroys all containers and volumes)
-sudo rm -rf /var/lib/rkl/pods/* /var/lib/rkl/volumes/* /var/lib/rkl/slayerfs/*
-sudo rm -rf /var/lib/rkl/bundle/*
+# 6. Restart RKS and RKL
+# Re-run Steps 7 and 8
 
-# 5. Optionally clear image cache (will need to re-pull + re-fix pause)
-# sudo rm -rf /var/lib/rkforge/layers/* /var/lib/rkforge/metadata/*
-
-# 6. Restart Xline (optional, only if Xline has issues)
-docker stop node1 node2 node3 client 2>/dev/null
-docker rm node1 node2 node3 client 2>/dev/null
-# Then re-run Step 6 from SKILL.md
-
-# 7. Restart RKS and RKL daemon
-# Re-run Steps 7 and 8 from SKILL.md
+# 7. Deploy pods one at a time
+# Re-run Step 9
 ```
