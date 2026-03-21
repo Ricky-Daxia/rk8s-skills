@@ -10,12 +10,13 @@ This skill deploys a complete rk8s cluster on a single machine with 4 pods (1 ng
 ## Architecture
 
 ```
-┌─ Single Machine ──────────────────────────────┐
-│  Xline (3 Docker containers) ← state storage  │
-│  RKS (control plane)         ← scheduler, CSI │
-│  RKL daemon (worker node)    ← container mgmt │
-│  SlayerFS (FUSE)             ← volume backend │
-└────────────────────────────────────────────────┘
+┌─ Single Machine ──────────────────────────────────┐
+│  Xline (3 Docker containers)  ← state storage     │
+│  RKS (control plane)          ← scheduler, CSI    │
+│  RKL daemon (worker node)     ← container mgmt    │
+│  libfuse overlay (per-container) ← rootfs mount   │
+│  SlayerFS (FUSE, in-process)  ← volume backend    │
+└────────────────────────────────────────────────────┘
 
 Pods deployed:
   nginx     (nginx:latest)    + slayerfs volume at /data
@@ -112,8 +113,8 @@ EOF
 sudo killall rkl rks 2>/dev/null
 sleep 2
 
-# Unmount all rkl-related FUSE mounts (MUST do before rm)
-mount | grep -E "fuse.*rkl|slayerfs.*rkl" | awk '{print $3}' | while read mnt; do
+# Unmount all rkl-related FUSE and overlay mounts (MUST do before rm)
+mount | grep -E "fuse.*rkl|slayerfs|overlay.*rkl" | awk '{print $3}' | while read mnt; do
   sudo umount -l "$mnt" 2>/dev/null
 done
 
@@ -205,9 +206,11 @@ Verify: `tail -5 /tmp/rks.log` should show subnet allocation and "local rks node
 Skip if already running (`ps aux | grep 'rkl.*daemon'`).
 
 ```bash
-sudo sh -c "RKS_ADDRESS=127.0.0.1:50051 nohup $BIN/rkl pod daemon > /tmp/rkl-daemon.log 2>&1 &"
+sudo sh -c "RKS_ADDRESS=127.0.0.1:50051 RKL_USE_LIBFUSE=1 nohup $BIN/rkl pod daemon > /tmp/rkl-daemon.log 2>&1 &"
 sleep 5
 ```
+
+`RKL_USE_LIBFUSE=1` enables the libfuse overlay backend for container rootfs. This causes each container to get a FUSE-based overlayfs mount at `<bundle>/merged/`, served by a dedicated `rkl mount --daemon --libfuse` child process. Without this flag, Linux native kernel overlayfs is used instead.
 
 Verify: `tail -5 /tmp/rks.log` should show heartbeat messages from the worker node.
 
@@ -390,7 +393,7 @@ done
 sudo killall rkl rks 2>/dev/null
 
 # Clean runtime state (required for clean re-deployment)
-mount | grep -E "fuse.*rkl|slayerfs.*rkl" | awk '{print $3}' | while read mnt; do
+mount | grep -E "fuse.*rkl|slayerfs|overlay.*rkl" | awk '{print $3}' | while read mnt; do
   sudo umount -l "$mnt" 2>/dev/null
 done
 sudo find /run/youki -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
@@ -421,3 +424,5 @@ docker network rm xline_net 2>/dev/null
 | `rm -rf /var/lib/rkl/*` doesn't work | Active FUSE mounts prevent deletion | Unmount all FUSE mounts first (Step 5) |
 | Pod stuck in Pending (no errors) | RKL daemon not connected | Check `tail /tmp/rks.log` for heartbeats |
 | rkforge pull very slow / timeout | Registry bandwidth limited (~60MB takes 5-10 min) | Wait, or use a local registry |
+| No FUSE mount on rootfs `merged/` | RKL started without `RKL_USE_LIBFUSE=1` | Restart RKL daemon with `RKL_USE_LIBFUSE=1` env var |
+| `rkl mount --daemon --libfuse` processes not visible | Normal for SlayerFS volumes — they run as async tasks inside the rkl daemon, not separate processes | Only rootfs overlay gets dedicated `rkl mount` child processes; SlayerFS FUSE sessions are in-process (check via `/proc/<rkl-pid>/fd \| grep /dev/fuse`) |
