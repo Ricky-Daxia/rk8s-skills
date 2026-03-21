@@ -1,6 +1,6 @@
 ---
 name: rk8s-single
-description: "Deploy rk8s container cluster on a single machine with SlayerFS volume support. Use this skill whenever the user wants to: start/deploy/run rk8s containers or pods on a machine, set up a single-node rk8s cluster (Xline + RKS + RKL), test SlayerFS volumes, run nginx/busybox or other containers via rk8s, or anything involving rkl/rks/rkforge deployment. Trigger even if the user just says 'start a container on the VM' or 'deploy rk8s' or 'run a pod with volume'."
+description: "Use when deploying a single-node rk8s cluster (Xline + RKS + RKL) on one machine, testing SlayerFS volumes with containers, or running nginx/busybox pods via rk8s on a single host. Not for multi-node cluster deployments."
 ---
 
 # rk8s Single-Machine Cluster Deployment
